@@ -1,135 +1,99 @@
 #!/bin/bash
 
-# WhatsApp Shell Bot Installer (Final Version)
-# by ChatGPT (2025)
+# ========== Persiapan ==========
+echo "[*] Update & install dependensi..."
+apt update && apt install -y curl git unzip wget nodejs npm
 
-set -e
+# ========== Pasang Node.js 20 ==========
+echo "[*] Install Node.js 20.x..."
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
 
-# Pastikan dijalankan sebagai root
-if [[ "$EUID" -ne 0 ]]; then
-  echo "❌ Jalankan sebagai root!"
-  exit 1
+# ========== Folder Bot ==========
+BOT_DIR="/opt/wa-vps-control"
+if [ -d "$BOT_DIR" ]; then
+    rm -rf "$BOT_DIR"
 fi
+mkdir -p "$BOT_DIR"
+cd "$BOT_DIR"
 
-echo "🚀 Instalasi WhatsApp Shell Bot dimulai..."
+# ========== Simpan Bot ==========
+echo "[*] Membuat file bot..."
+cat > bot.js << 'EOF'
+import makeWASocket, { useSingleFileAuthState } from '@whiskeysockets/baileys'
+import { Boom } from '@hapi/boom'
+import fs from 'fs'
+import { exec } from 'child_process'
 
-# Update dan install dependensi
-apt update && apt upgrade -y
-apt install -y curl git nodejs npm
-
-# Pakai Node.js v18 jika belum ada
-NODE_VERSION=$(node -v 2>/dev/null || echo "v0.0.0")
-if [[ "$NODE_VERSION" < "v16" ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-  apt install -y nodejs
-fi
-
-# Konfigurasi NPM mirror dan bersihkan cache
-npm config set registry https://registry.npmmirror.com
-npm cache clean --force
-
-# Siapkan folder bot
-rm -rf /opt/wa-vps
-mkdir -p /opt/wa-vps
-cd /opt/wa-vps
-
-# Buat file index.js
-cat > index.js <<'EOF'
-const { default: makeWASocket, useSingleFileAuthState } = require('@whiskeysockets/baileys')
-const { exec } = require('child_process')
-const fs = require('fs')
-
-const config = JSON.parse(fs.readFileSync('./config.json'))
 const { state, saveState } = useSingleFileAuthState('./auth.json')
 
 async function startBot() {
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true
-  })
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true
+    })
 
-  sock.ev.on('creds.update', saveState)
+    sock.ev.on('creds.update', saveState)
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg?.message || !msg.key.remoteJid) return
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0]
+        if (!msg.message || msg.key.fromMe) return
 
-    const sender = msg.key.remoteJid
-    const isOwner = config.allowed.includes(sender.replace('@s.whatsapp.net', ''))
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
+        const sender = msg.key.remoteJid
+        const body = msg.message.conversation || msg.message.extendedTextMessage?.text
+        if (!body) return
 
-    if (!isOwner) {
-      await sock.sendMessage(sender, { text: '❌ Anda tidak diizinkan menggunakan bot ini.' })
-      return
-    }
+        console.log(`[CMD] ${sender}: ${body}`)
 
-    if (text.length > 0) {
-      exec(text, { timeout: 30000, maxBuffer: 1024 * 1024 * 10 }, async (err, stdout, stderr) => {
-        const result = err ? stderr || err.message : stdout || '[✅] Perintah dijalankan.'
-        const reply = `📥 Perintah:\n\`\`\`${text}\`\`\``
+        exec(body, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+            let output = ""
+            if (err) output = "❌ Error:\n" + stderr
+            else output = stdout || "✅ Perintah berhasil tanpa output."
 
-        if (result.length <= 4000) {
-          await sock.sendMessage(sender, {
-            text: `${reply}\n\n📤 Output:\n\`\`\`\n${result.trim()}\n\`\`\``
-          })
-        } else {
-          const path = '/tmp/output.txt'
-          fs.writeFileSync(path, result)
-          await sock.sendMessage(sender, {
-            text: `${reply}\n\n📤 Output terlalu panjang. Dikirim sebagai file:`,
-          })
-          await sock.sendMessage(sender, {
-            document: { url: path },
-            fileName: 'output.txt',
-            mimetype: 'text/plain'
-          })
+            sock.sendMessage(sender, { text: output.slice(0, 4096) }) // 4096: aman untuk WA
+        })
+    })
+
+    sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut
+            console.log('Connection closed. Reconnecting...', shouldReconnect)
+            if (shouldReconnect) startBot()
         }
-      })
-    }
-  })
+    })
 }
 
 startBot()
 EOF
 
-# Buat package.json
-cat > package.json <<'EOF'
+# ========== Inisialisasi Project ==========
+echo "[*] Inisialisasi npm..."
+npm init -y
+npm install @whiskeysockets/baileys@6.7 typescript ts-node @types/node
+
+# ========== TypeScript Config ==========
+cat > tsconfig.json << 'EOF'
 {
-  "name": "wa-vps",
-  "version": "1.0.0",
-  "main": "index.js",
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.6.0"
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "strict": true,
+    "esModuleInterop": true,
+    "outDir": "dist"
   }
 }
 EOF
 
-# Input nomor owner
-read -p "📱 Masukkan nomor WhatsApp Anda (format: 628xxxx): " OWNER
-
-# Buat config.json
-cat > config.json <<EOF
-{
-  "owner": "$OWNER",
-  "allowed": ["$OWNER"]
-}
-EOF
-
-# Install dependensi Node.js
-npm install || {
-  echo "❌ Gagal install. Coba ulangi dengan koneksi stabil."
-  exit 1
-}
-
-# Buat systemd service
+# ========== Service Systemd ==========
+echo "[*] Menyiapkan systemd service..."
 cat > /etc/systemd/system/wa-vps.service <<EOF
 [Unit]
-Description=WhatsApp Shell Bot
+Description=WhatsApp VPS Control Bot
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/node /opt/wa-vps/index.js
-WorkingDirectory=/opt/wa-vps
+ExecStart=/usr/bin/npx ts-node $BOT_DIR/bot.js
+WorkingDirectory=$BOT_DIR
 Restart=always
 User=root
 Environment=NODE_ENV=production
@@ -138,17 +102,10 @@ Environment=NODE_ENV=production
 WantedBy=multi-user.target
 EOF
 
-# Aktifkan dan jalankan
+# ========== Enable & Jalankan ==========
+systemctl daemon-reexec
 systemctl daemon-reload
 systemctl enable wa-vps
-systemctl restart wa-vps
+systemctl start wa-vps
 
-echo "✅ Bot berhasil diinstal dan berjalan sebagai service!"
-echo "ℹ️ Jalankan perintah berikut untuk scan QR code login WhatsApp:"
-echo ""
-echo "   journalctl -u wa-vps -f"
-echo ""
-echo "🟢 Setelah login, kirim perintah apapun via WhatsApp:"
-echo "   uptime"
-echo "   whoami"
-echo "   ls -lah /etc"
+echo "[✅] Bot berhasil dijalankan. Silakan scan QR code di terminal."
