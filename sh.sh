@@ -1,111 +1,119 @@
 #!/bin/bash
 
-# ========== Persiapan ==========
-echo "[*] Update & install dependensi..."
-apt update && apt install -y curl git unzip wget nodejs npm
+set -e
 
-# ========== Pasang Node.js 20 ==========
-echo "[*] Install Node.js 20.x..."
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+echo "🟢 Memulai setup WhatsApp Linux Bot..."
+
+# Update & install dependencies
+apt update && apt upgrade -y
+apt install -y curl git build-essential
+
+# Install Node.js LTS terbaru via NodeSource
+curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
 apt install -y nodejs
 
-# ========== Folder Bot ==========
-BOT_DIR="/opt/wa-vps-control"
-if [ -d "$BOT_DIR" ]; then
-    rm -rf "$BOT_DIR"
-fi
-mkdir -p "$BOT_DIR"
-cd "$BOT_DIR"
+# Cek versi Node.js
+echo "✅ Node.js terpasang: $(node -v)"
 
-# ========== Simpan Bot ==========
-echo "[*] Membuat file bot..."
-cat > bot.js << 'EOF'
-import makeWASocket, { useSingleFileAuthState } from '@whiskeysockets/baileys'
-import { Boom } from '@hapi/boom'
-import fs from 'fs'
-import { exec } from 'child_process'
+# Dapatkan IP publik
+IP_PUB=$(curl -s ifconfig.me || wget -qO- ifconfig.me)
+echo "🌐 IP Publik VPS: $IP_PUB"
 
-const { state, saveState } = useSingleFileAuthState('./auth.json')
+# Buat direktori bot
+BOT_DIR="$HOME/wa-linux-bot"
+rm -rf $BOT_DIR
+mkdir -p $BOT_DIR
+cd $BOT_DIR
 
-async function startBot() {
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true
-    })
-
-    sock.ev.on('creds.update', saveState)
-
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0]
-        if (!msg.message || msg.key.fromMe) return
-
-        const sender = msg.key.remoteJid
-        const body = msg.message.conversation || msg.message.extendedTextMessage?.text
-        if (!body) return
-
-        console.log(`[CMD] ${sender}: ${body}`)
-
-        exec(body, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-            let output = ""
-            if (err) output = "❌ Error:\n" + stderr
-            else output = stdout || "✅ Perintah berhasil tanpa output."
-
-            sock.sendMessage(sender, { text: output.slice(0, 4096) }) // 4096: aman untuk WA
-        })
-    })
-
-    sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut
-            console.log('Connection closed. Reconnecting...', shouldReconnect)
-            if (shouldReconnect) startBot()
-        }
-    })
-}
-
-startBot()
-EOF
-
-# ========== Inisialisasi Project ==========
-echo "[*] Inisialisasi npm..."
+# Inisialisasi project Node.js
 npm init -y
-npm install @whiskeysockets/baileys@6.7 typescript ts-node @types/node
 
-# ========== TypeScript Config ==========
-cat > tsconfig.json << 'EOF'
-{
-  "compilerOptions": {
-    "target": "es2020",
-    "module": "commonjs",
-    "strict": true,
-    "esModuleInterop": true,
-    "outDir": "dist"
-  }
-}
+# Install dependencies
+npm install whatsapp-web.js qrcode express
+
+# Buat file index.js
+cat <<EOF > index.js
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode');
+const express = require('express');
+const { exec } = require('child_process');
+
+const app = express();
+const port = 3000;
+
+let currentQR = '';
+const ADMIN_NUMBER = '6281234567890@c.us'; // Ganti dengan nomor kamu
+
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: { headless: true, args: ['--no-sandbox'] }
+});
+
+client.on('qr', async (qr) => {
+    currentQR = qr;
+    console.log('📲 QR tersedia. Akses lewat browser.');
+});
+
+app.get('/', async (req, res) => {
+    if (!currentQR) return res.send('QR belum tersedia.');
+    const qrImg = await qrcode.toDataURL(currentQR);
+    res.send(\`<h2>Scan QR WhatsApp</h2><img src="\${qrImg}"/>\`);
+});
+
+app.listen(port, () => {
+    console.log(\`🌐 QR Web aktif di http://${IP_PUB}:\${port}\`);
+});
+
+client.on('ready', () => {
+    console.log('✅ Bot siap menerima perintah Linux.');
+    client.sendMessage(ADMIN_NUMBER, '🤖 Bot siap! Kirim perintah Linux apa pun.');
+});
+
+client.on('message', async msg => {
+    if (msg.from !== ADMIN_NUMBER) return;
+
+    const command = msg.body;
+    exec(command, { maxBuffer: 1024 * 1000 }, (error, stdout, stderr) => {
+        let result = '';
+        if (error) result += \`❌ ERROR:\\n\${error.message}\\n\`;
+        if (stderr) result += \`⚠️ STDERR:\\n\${stderr}\\n\`;
+        if (stdout) result += \`📤 STDOUT:\\n\${stdout}\\n\`;
+
+        // Bagi output jika terlalu panjang
+        const chunkSize = 3900;
+        for (let i = 0; i < result.length; i += chunkSize) {
+            client.sendMessage(msg.from, result.slice(i, i + chunkSize));
+        }
+    });
+});
+
+client.initialize();
 EOF
 
-# ========== Service Systemd ==========
-echo "[*] Menyiapkan systemd service..."
-cat > /etc/systemd/system/wa-vps.service <<EOF
+# Buat file systemd service
+cat <<EOF > /etc/systemd/system/wa-bot.service
 [Unit]
-Description=WhatsApp VPS Control Bot
+Description=WhatsApp Linux Bot
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/npx ts-node $BOT_DIR/bot.js
 WorkingDirectory=$BOT_DIR
+ExecStart=$(which node) $BOT_DIR/index.js
 Restart=always
-User=root
+User=$USER
+Environment=PATH=/usr/bin:/usr/local/bin
 Environment=NODE_ENV=production
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ========== Enable & Jalankan ==========
+# Aktifkan service
 systemctl daemon-reexec
 systemctl daemon-reload
-systemctl enable wa-vps
-systemctl start wa-vps
+systemctl enable wa-bot
+systemctl restart wa-bot
 
-echo "[✅] Bot berhasil dijalankan. Silakan scan QR code di terminal."
+echo "✅ Bot selesai diinstall dan aktif!"
+echo "🌐 Akses QR Code: http://$IP_PUB:3000"
+echo "✏️ Ubah nomor admin di: $BOT_DIR/index.js lalu restart: systemctl restart wa-bot"
